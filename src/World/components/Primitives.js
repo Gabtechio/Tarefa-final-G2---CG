@@ -40,6 +40,27 @@ class Primitives {
     return texture;
   }
 
+  // Teto texturizado (cinza claro com pontinhos), usado também como bumpMap
+  static noiseTexture(repeat = 4) {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 256;
+    const g = canvas.getContext('2d');
+    g.fillStyle = '#d6d6d2';
+    g.fillRect(0, 0, 256, 256);
+    for (let i = 0; i < 2500; i++) {
+      const light = Math.random() > 0.5;
+      g.fillStyle = light ? 'rgba(255,255,255,0.55)' : 'rgba(90,90,85,0.35)';
+      g.beginPath();
+      g.arc(Math.random() * 256, Math.random() * 256, 0.8 + Math.random() * 1.6, 0, Math.PI * 2);
+      g.fill();
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(repeat, repeat);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+  }
+
   static dispose(root) {
     root.traverse((o) => {
       o.geometry?.dispose();
