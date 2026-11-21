@@ -101,38 +101,164 @@ class Classroom {
     }
     sofa.add(sofaBody);
 
-    // [cor, x, y, z, rotX, rotY, rotZ] — posição/inclinação de cada almofada no sofá
-    const PILLOW_DZ = 0.1; // avanço das almofadas para não entrarem no encosto do sofá
+    // Almofadas como na foto. [cor, x, modo, inclinação, giro, rotação no plano, texto]
+    // modo: 'lean' = apoiada no encosto, 'lie' = deitada no assento, 'top' = deitada por cima das outras
+    // y e z são calculados a partir da superfície real do sofá (assento e encosto), sem flutuar.
+    const PW = 0.42, PT = 0.13; // largura e espessura
+    const SINK = 0.01;          // quanto as almofadas afundam no tecido ao encostar (m). Deixe pequeno (0.01).
+    const LIFT = 0.0;           // ALTURA: sobe (+) ou desce (-) as almofadas encostadas em relação à base da roxa (m). 0 = mesma altura.
+    // [cor, x, modo, inclinação, giro, rotação no plano, texto, dz (avanço em relação ao encosto)]
     const pillowSpecs = [
-      [0xb28cf0, -0.85, 0.52, -0.02, -1.0, 0.5, 0.0],   // roxa deitada
-      [0xe83f9b, -0.42, 0.64, -0.14, -0.25, 0.25, 0.1],  // rosa
-      [0x7cc4f2, 0.01, 0.64, -0.16, -0.25, 0.0, -0.05],  // azul
-      [0xf5a58f, 0.44, 0.64, -0.15, -0.25, -0.2, 0.08],  // pêssego
-      [0xf5a58f, 0.83, 0.64, -0.17, -0.3, -0.35, -0.1],  // pêssego (canto)
+      // (em 'lie', giro + rotação no plano se somam: -0.78 = losango a 45° como na foto)
+      // ORDEM = de trás para frente: cada almofada se apoia nas que já foram colocadas.
+      // rosa, azul e pêssego: mesma inclinação, giro e altura, lado a lado (0.41 m de passo), rentes ao encosto.
+      // Texto da azul e da pêssego girado 90° (-π/2), o da rosa na horizontal.
+      // A roxa vem PRIMEIRO: a altura da base dela (apoiada no assento) é a referência para as outras.
+      [0xb28cf0, -0.62, 'lie', -1.45, -0.78, 0.0, 'Inovação', 0],             // roxa deitada no assento, girada ~45°
+      [0xf5a58f, 0.77, 'lean', -0.30, -0.30, -Math.PI / 2, 'Ação', 0],        // pêssego (direita)
+      [0x7cc4f2, 0.36, 'lean', -0.30, -0.30, -Math.PI / 2, 'Ação', 0],        // azul (meio)
+      [0xe83f9b, -0.05, 'lean', -0.30, -0.30, 0.0, 'Colaboração', 0],         // rosa (esquerda)
+      [0xf5a58f, 0.72, 'top', -1.10, -0.30, -0.15, '', 0],                    // 2ª pêssego: por cima das três e do topo do encosto
     ];
-    const pillows = pillowSpecs.map(([c, x, y, z, rx, ry, rz]) => {
-      const p = box(0.38, 0.38, 0.11, mat(c, { roughness: 1 }), x, y, z + PILLOW_DZ);
-      p.rotation.set(rx, ry, rz);
-      sofa.add(p);
-      return p;
-    });
+    let pillowGroup = null;
+
+    // Encosta a almofada no sofá medindo com raios (pontos da malha da almofada -> superfície do sofá):
+    // desce até tocar o assento, recua até tocar o encosto (ou a almofada de trás) e desce de novo.
+    // 'top' só desce, apoiando-se nas outras almofadas. Sem sofá medido (probe nulo) não faz nada.
+    // `baseY`: altura (y local do sofá) da base da roxa; as 'lean' são niveladas por ela. Retorna a base desta almofada.
+    const snapPillow = (p, probe, mode, others, baseY = null) => {
+      if (!probe) return null;
+      const v = new THREE.Vector3();
+      const points = () => {
+        sofa.updateMatrixWorld(true);
+        const meshes = [];
+        let total = 0;
+        p.traverse((o) => {
+          const n = o.isMesh && o.geometry.attributes.position?.count;
+          if (n > 4) { meshes.push(o); total += n; }          // ignora o plano do texto
+        });
+        const step = Math.max(1, Math.floor(total / 800));     // ~800 pontos por almofada (só os da borda são lançados)
+        const pts = [];
+        meshes.forEach((o) => {
+          const pos = o.geometry.attributes.position;
+          for (let i = 0; i < pos.count; i += step) {
+            v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+            pts.push(sofa.worldToLocal(v.clone()));
+          }
+        });
+        return pts;
+      };
+      // menor folga entre os pontos da almofada e a superfície atingida pelo raio (aceita penetração de até 12 cm)
+      // `edge`: só a borda de baixo (eixo y) ou de trás (eixo z) conta; senão o topo da almofada, que fica
+      // dentro/acima do encosto, "apoiaria" no encosto e levantaria a almofada inteira.
+      const gap = (cast, axis, edge = false) => {
+        let g = Infinity;
+        const pts = points();
+        const lim = edge ? Math.min(...pts.map((q) => q[axis])) + 0.08 : Infinity;
+        for (const q of pts) {
+          if (q[axis] > lim) continue;
+          const hit = cast(q);
+          if (!hit) continue;
+          const d = axis === 'y' ? q.y - hit.y : q.z - hit.z;
+          if (d > -0.12 && d < 0.8) g = Math.min(g, d);
+        }
+        return g;
+      };
+      const drop = (extra, edge = true) => {
+        const g = gap((q) => probe.down(q.x, q.y, q.z, extra), 'y', edge);
+        if (Number.isFinite(g)) p.position.y -= g - SINK;
+      };
+      // ponto mais baixo da almofada (usa todos os vértices)
+      const bottom = () => {
+        sofa.updateMatrixWorld(true);
+        let m = Infinity;
+        p.traverse((o) => {
+          const pos = o.isMesh && o.geometry.attributes.position;
+          if (!pos || pos.count <= 4) return;
+          for (let i = 0; i < pos.count; i++) {
+            v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+            m = Math.min(m, sofa.worldToLocal(v).y);
+          }
+        });
+        return m;
+      };
+      if (mode === 'top') { drop(others, false); return null; } // a de cima conta todos os pontos e se apoia nas outras
+      drop([]);
+      if (mode === 'lean') {
+        const g = gap((q) => probe.back(q.x, q.y, q.z), 'z', true);   // só o sofá: as três ficam coladas no encosto
+        if (Number.isFinite(g)) p.position.z -= g - SINK;
+        drop([]);
+        // mesma altura de base da roxa (a de cima acompanha, pois se apoia nestas)
+        if (baseY !== null) p.position.y += baseY - bottom() + LIFT;
+      }
+      return mode === 'lie' ? bottom() : null;
+    };
+    const buildPillows = (probe, pillowModel) => {
+      if (pillowGroup) sofa.remove(pillowGroup);
+      pillowGroup = new THREE.Group();
+      sofa.add(pillowGroup);
+      const placed = []; // malhas das almofadas já colocadas (servem de apoio para as próximas)
+      const leans = [];  // almofadas encostadas no encosto (rosa, azul, pêssego)
+      let baseY = null;  // altura da base da roxa (referência)
+      const dflt = probe ? { seat: 0.42, back: -0.08 } : { seat: 0.45, back: -0.25 };
+      pillowSpecs.forEach(([c, x, mode, rx, ry, rz, label, dz]) => {
+        const a = Math.abs(rx);
+        const hh = (PW / 2) * (Math.abs(Math.cos(rz)) + Math.abs(Math.sin(rz))); // meia altura da almofada girada
+        const seat = probe?.seatY(x, dflt.back + 0.3) ?? dflt.seat;
+        // z do encosto medido na altura do topo da almofada (o encosto é inclinado); se errar, mede mais baixo
+        const back = probe?.backZ(x, seat + 2 * hh * Math.cos(a) * 0.9)
+          ?? probe?.backZ(x, seat + 0.2) ?? dflt.back;
+        let y = seat + hh * Math.cos(a) + (PT / 2) * Math.sin(a) + 0.005;
+        let z = back + hh * Math.sin(a) + (PT / 2) * Math.cos(a) + 0.02;
+        if (mode === 'lie') z = back + 0.28;
+        else z += dz;
+        if (mode === 'top') {
+          y = seat + 0.52;    // começa um pouco acima e desce até se apoiar nas três e no encosto
+          z = back - 0.03;    // parte de baixo sobre o topo das três, parte de cima atrás do encosto
+        }
+
+        let p;
+        try {
+          p = pillowModel ? Assets.cushion(pillowModel, PW, PW, PT, c, label) : Assets.pillow(PW, PT, c, label);
+        } catch (e) {
+          console.error('almofada: erro ao montar, usando a procedural', e);
+          p = Assets.pillow(PW, PT, c, label);
+        }
+        p.position.set(x, y, z);
+        p.rotation.set(rx, ry, rz, 'YXZ');
+        pillowGroup.add(p);
+        if (mode === 'top' && leans.length) {
+          // iguala altura e profundidade das três almofadas encostadas (o assento pode variar de uma almofada à outra)
+          const ly = Math.max(...leans.map((q) => q.position.y));
+          const lz = Math.max(...leans.map((q) => q.position.z));
+          leans.forEach((q) => { q.position.y = ly; q.position.z = lz; });
+        }
+        const base = snapPillow(p, probe, mode, placed.slice(), baseY);
+        if (mode === 'lie' && base !== null) baseY = base;
+        if (mode === 'lean') leans.push(p);
+        p.traverse((o) => { if (o.isMesh) placed.push(o); });
+      });
+    };
+    buildPillows(null, null);
     sofa.position.set(-0.9, 0, -1.2);
     scene.add(sofa);
 
     // ---- Poltrona marrom giratória (suede) ----
     const brown = mat(0x5a3b2b, { roughness: 1 });
     const chair = new THREE.Group();
-    chair.add(box(0.9, 0.28, 0.8, brown, 0, 0.29, 0));
-    chair.add(box(0.56, 0.16, 0.6, mat(0x65422f, { roughness: 1 }), 0, 0.5, 0.05));  // almofada do assento
-    chair.add(box(0.9, 0.6, 0.2, brown, 0, 0.65, -0.3));
-    for (const dx of [-0.365, 0.365]) chair.add(box(0.17, 0.6, 0.8, brown, dx, 0.45, 0));
+    const chairBody = new THREE.Group(); // corpo procedural (substituído pelo asset)
+    chairBody.add(box(0.9, 0.28, 0.8, brown, 0, 0.29, 0));
+    chairBody.add(box(0.56, 0.16, 0.6, mat(0x65422f, { roughness: 1 }), 0, 0.5, 0.05));  // almofada do assento
+    chairBody.add(box(0.9, 0.6, 0.2, brown, 0, 0.65, -0.3));
+    for (const dx of [-0.365, 0.365]) chairBody.add(box(0.17, 0.6, 0.8, brown, dx, 0.45, 0));
     const dark = mat(0x111111, { metalness: 0.6 });
-    chair.add(new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.14, 8), dark).translateY(0.08));
+    chairBody.add(new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.14, 8), dark).translateY(0.08));
     [0, 2.1, 4.2].forEach((a) => {
       const leg = box(0.4, 0.02, 0.04, dark, 0, 0.02, 0);
       leg.rotation.y = a;
-      chair.add(leg);
+      chairBody.add(leg);
     });
+    chair.add(chairBody);
     chair.position.set(1.15, 0, -0.4);
     chair.rotation.y = -0.6;
     scene.add(chair);
@@ -178,25 +304,41 @@ class Classroom {
       scene.add(root);
     }).catch((e) => console.warn('planta.glb não carregou, mantendo a procedural', e));
 
-    // Sofá (.dae + texturas PBR): maior lado = 2.3 m. Se ficar de costas, use fitLength(model, 2.3, Math.PI)
-    Assets.loadDAE(`${MODELS}sofa/sofa.dae`).then((model) => {
-      if (disposed) return;
+    // Sofá (.dae + texturas PBR) e almofadas (.3ds): carregam juntos, e as almofadas são
+    // posicionadas medindo a superfície do sofá. Se o sofá ficar de costas: fitLength(model, 2.3, Math.PI)
+    const sofaP = Assets.loadDAE(`${MODELS}sofa/sofa.dae`).then((model) => {
       Assets.pbr(model, `${MODELS}sofa/textures/`, '01___Default');
-      sofa.remove(sofaBody);
-      sofa.add(Assets.fitLength(model, 2.3));
-    }).catch((e) => console.warn('sofa.dae não carregou, mantendo o procedural', e));
+      const root = Assets.fitLength(model, 2.3);
+      return root;
+    }).catch((e) => { console.warn('sofa.dae não carregou, mantendo o procedural', e); return null; });
+    const pillowP = Assets.load3DS(`${MODELS}almofada/almofada.3ds`, `${MODELS}almofada/textures/`)
+      .catch((e) => { console.warn('almofada.3ds não carregou, mantendo as procedurais', e); return null; });
 
-    // Almofadas (.3ds): cada uma é um clone do modelo com a cor de pillowSpecs
-    Assets.load3DS(`${MODELS}almofada/almofada.3ds`, `${MODELS}almofada/textures/`).then((model) => {
+    Promise.all([sofaP, pillowP]).then(([sofaRoot, pillowModel]) => {
       if (disposed) return;
-      pillowSpecs.forEach(([c, x, y, z, rx, ry, rz], i) => {
-        const p = Assets.cushion(model, 0.42, 0.42, 0.12, c);
-        p.position.set(x, y, z + PILLOW_DZ);
-        p.rotation.set(rx, ry, rz);
-        sofa.remove(pillows[i]);
-        sofa.add(p);
-      });
-    }).catch((e) => console.warn('almofada.3ds não carregou, mantendo as procedurais', e));
+      let probe = null;
+      try {
+        if (sofaRoot) {
+          sofa.remove(sofaBody);
+          sofa.add(sofaRoot);
+          scene.updateMatrixWorld(true);
+          probe = Assets.sofaProbe(sofa, sofaRoot);
+        }
+      } catch (e) { console.error('sofá: erro ao medir a superfície', e); }
+      console.info('almofadas -> modelo .3ds:', !!pillowModel, '| sofá medido:', !!probe);
+      buildPillows(probe, pillowModel);
+    }).catch((e) => console.error('erro ao montar sofá/almofadas', e));
+
+    // Poltrona (.3ds, Z para cima): gira para Y para cima e ajusta a 0.95 m de largura
+    Assets.load3DS(`${MODELS}poltrona/poltrona.3ds`, `${MODELS}poltrona/textures/`).then((model) => {
+      if (disposed) return;
+      Assets.paint(model, 0x6a4a3a); // marrom suede da foto (cor lisa)
+      model.rotation.x = -Math.PI / 2;
+      const upright = new THREE.Group();
+      upright.add(model);
+      chair.remove(chairBody);
+      chair.add(Assets.fitLength(upright, 0.95));
+    }).catch((e) => console.warn('poltrona.3ds não carregou, mantendo a procedural', e));
 
     return {
       scene,
